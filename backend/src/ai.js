@@ -1,93 +1,157 @@
 /**
- * AI-Powered Recommendation Engine
- * ════════════════════════════════════════════════════════════════
- * STATUS: READY TO ACTIVATE — just add your API key to .env
+ * Score Routes (all require auth)
  *
- * To enable:
- *  1. Add ANTHROPIC_API_KEY=your_key_here  to your .env file
- *     (OR use OPENAI_API_KEY=your_key_here for OpenAI GPT-4)
- *  2. Run: npm install @anthropic-ai/sdk   (or: npm install openai)
- *  3. In server.js, uncomment the import and the getAIRecommendations call
- *
- * Cost estimate: ~KES 0.50–2 per recommendation call at current pricing
- * ════════════════════════════════════════════════════════════════
+ * POST /api/score    — calculate + persist score for current user
+ * GET  /api/history  — return last 12 scores for current user
  */
 
-// import Anthropic from "@anthropic-ai/sdk";
-// const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+import { Router } from "express";
+import { prisma } from "../lib/prisma.js";
+import { requireAuth } from "../middleware/auth.js";
+import { calcLDVS, getGrade } from "../ldvs.js";
+import { generateRecs } from "../recommendations.js";
+import { getAIRecommendations } from "../ai.js";
 
-// ── OR use OpenAI instead ──
-// import OpenAI from "openai";
-// const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const router = Router();
+router.use(requireAuth);
 
-/**
- * Generates rich, context-aware, bilingual recommendations using Claude or GPT.
- * Falls back to rule-based recs if the API call fails.
- */
-export async function getAIRecommendations({
-  score, profileComplete, postFreq, engagement, responsiveness,
-  platforms, businessName, sector, location, language = "en",
-}) {
+// ── Calculate + save score ────────────────────────────────────────────────────
+router.post("/", async (req, res) => {
+  const {
+    profileComplete, postFreq, engagement, responsiveness,
+    platforms, businessName, sector, location,
+    language = "en", source = "manual",
+  } = req.body;
 
-  const langInstruction = language === "sw"
-    ? "Respond ENTIRELY in Swahili (Kiswahili). Use simple, everyday language suitable for a Kenyan business owner."
-    : "Respond in English. Use simple, jargon-free language suitable for a Kenyan SME owner.";
-
-  const prompt = `
-You are a digital marketing expert specializing in helping Kenyan small businesses grow their online presence.
-
-Analyze the following business metrics and provide 3-5 specific, actionable growth recommendations.
-
-Business Details:
-- Name: ${businessName || "Unknown"}
-- Sector: ${sector || "General"}
-- Location: ${location || "Kenya"}
-- Active Platforms: ${platforms?.join(", ") || "None specified"}
-
-Digital Presence Scores (0-100):
-- Profile Completeness: ${profileComplete}/100
-- Posting Frequency: ${postFreq}/100
-- Engagement Level: ${engagement}/100
-- Responsiveness: ${responsiveness}/100
-- Overall LDVS Score: ${score}/100
-
-${langInstruction}
-
-Return a JSON array of recommendations. Each recommendation must have:
-- icon: (single emoji)
-- priority: "high" | "mid" | "low"  
-- title: (short, max 5 words)
-- desc: (2-3 sentences, specific and actionable for a Kenyan SME)
-
-Return ONLY the JSON array. No markdown, no preamble.
-Example format:
-[{"icon":"📱","priority":"high","title":"Activate WhatsApp Business","desc":"..."}]
-`;
+  // Input validation
+  const metrics = { profileComplete, postFreq, engagement, responsiveness };
+  for (const [key, val] of Object.entries(metrics)) {
+    const n = Number(val);
+    if (isNaN(n) || n < 0 || n > 100) {
+      return res.status(400).json({ error: `Invalid value for ${key}. Must be 0-100.` });
+    }
+  }
 
   try {
-    // ── CLAUDE (Anthropic) ──────────────────────────────────────────────
-    // const message = await anthropic.messages.create({
-    //   model: "claude-opus-4-6",
-    //   max_tokens: 1024,
-    //   messages: [{ role: "user", content: prompt }],
-    // });
-    // const text = message.content[0].text;
-    // return JSON.parse(text);
+    const scoreValue = calcLDVS({ profileComplete: Number(profileComplete), postFreq: Number(postFreq), engagement: Number(engagement), responsiveness: Number(responsiveness), platforms });
+    const grade = getGrade(scoreValue);
 
-    // ── OPENAI (GPT-4) ──────────────────────────────────────────────────
-    // const response = await openai.chat.completions.create({
-    //   model: "gpt-4o-mini", // Cheaper option, still very good
-    //   messages: [{ role: "user", content: prompt }],
-    //   response_format: { type: "json_object" },
-    // });
-    // return JSON.parse(response.choices[0].message.content);
+    // Generate AI recs (falls back through Groq → Gemini → Claude → rule-based)
+    const [recsEn, recsSw] = await Promise.all([
+      getAIRecommendations({ score: scoreValue, profileComplete: Number(profileComplete), postFreq: Number(postFreq), engagement: Number(engagement), responsiveness: Number(responsiveness), platforms, businessName, sector, location, language: "en" }),
+      getAIRecommendations({ score: scoreValue, profileComplete: Number(profileComplete), postFreq: Number(postFreq), engagement: Number(engagement), responsiveness: Number(responsiveness), platforms, businessName, sector, location, language: "sw" }),
+    ]);
 
-    throw new Error("AI module not activated yet — uncomment one of the blocks above");
+    // Persist score + recommendations in a transaction
+    const saved = await prisma.$transaction(async (tx) => {
+      const score = await tx.score.create({
+        data: {
+          userId:          req.user.id,
+          score:           scoreValue,
+          grade,
+          profileComplete: Number(profileComplete),
+          postFreq:        Number(postFreq),
+          engagement:      Number(engagement),
+          responsiveness:  Number(responsiveness),
+          platformCount:   platforms?.length || 0,
+          platforms:       platforms || [],
+          businessName:    businessName?.trim() || null,
+          sector:          sector || null,
+          location:        location || null,
+          source,
+        },
+      });
 
+      // Store paired EN/SW recs
+      await tx.recommendation.createMany({
+        data: recsEn.map((rec, i) => ({
+          scoreId:  score.id,
+          icon:     rec.icon,
+          priority: rec.priority,
+          titleEn:  rec.title,
+          titleSw:  recsSw[i]?.title || rec.title,
+          descEn:   rec.desc,
+          descSw:   recsSw[i]?.desc || rec.desc,
+        })),
+      });
+
+      return score;
+    });
+
+    // If user just onboarded, mark it
+    if (!req.body.hasOnboarded) {
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: { hasOnboarded: true },
+      }).catch(() => {}); // Non-fatal
+    }
+
+    const recs = language === "sw"
+      ? recsSw
+      : recsEn;
+
+    res.json({
+      id:             saved.id,
+      score:          scoreValue,
+      grade,
+      recs,
+      businessName,
+      sector,
+      location,
+      platforms:      platforms || [],
+      profileComplete: Number(profileComplete),
+      postFreq:        Number(postFreq),
+      engagement:      Number(engagement),
+      responsiveness:  Number(responsiveness),
+      date:   new Date().toLocaleDateString("en-KE", { month: "short", day: "numeric" }),
+      timestamp: saved.createdAt.getTime(),
+    });
   } catch (err) {
-    console.warn("AI recommendations unavailable, falling back to rule-based:", err.message);
-    // Import and use rule-based fallback
-    const { generateRecs } = await import("./recommendations.js");
-    return generateRecs({ profileComplete, postFreq, engagement, responsiveness, platforms }, language);
+    console.error("Score calculation error:", err);
+    res.status(500).json({ error: "Could not save score. Please try again." });
   }
-}
+});
+
+// ── Score history ─────────────────────────────────────────────────────────────
+router.get("/history", async (req, res) => {
+  const lang = req.query.lang || "en";
+
+  try {
+    const scores = await prisma.score.findMany({
+      where: { userId: req.user.id },
+      orderBy: { createdAt: "asc" },
+      take: 12,
+      include: { recommendations: true },
+    });
+
+    const result = scores.map(s => ({
+      id:             s.id,
+      score:          s.score,
+      grade:          s.grade,
+      profileComplete: s.profileComplete,
+      postFreq:        s.postFreq,
+      engagement:      s.engagement,
+      responsiveness:  s.responsiveness,
+      platforms:       s.platforms,
+      businessName:    s.businessName,
+      sector:          s.sector,
+      location:        s.location,
+      source:          s.source,
+      date:   s.createdAt.toLocaleDateString("en-KE", { month: "short", day: "numeric" }),
+      timestamp: s.createdAt.getTime(),
+      recs: s.recommendations.map(r => ({
+        icon:     r.icon,
+        priority: r.priority,
+        title:    lang === "sw" ? r.titleSw : r.titleEn,
+        desc:     lang === "sw" ? r.descSw  : r.descEn,
+      })),
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error("History error:", err);
+    res.status(500).json({ error: "Could not fetch score history." });
+  }
+});
+
+export default router;

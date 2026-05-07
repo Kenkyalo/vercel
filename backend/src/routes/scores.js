@@ -10,7 +10,7 @@ import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { calcLDVS, getGrade } from "../ldvs.js";
 import { generateRecs } from "../recommendations.js";
-// import { getAIRecommendations } from "../ai.js"; // uncomment when API key ready
+import { getAIRecommendations } from "../ai.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -36,9 +36,11 @@ router.post("/", async (req, res) => {
     const scoreValue = calcLDVS({ profileComplete: Number(profileComplete), postFreq: Number(postFreq), engagement: Number(engagement), responsiveness: Number(responsiveness), platforms });
     const grade = getGrade(scoreValue);
 
-    // Generate rule-based recs in both languages (store both, serve requested lang)
-    const recsEn = generateRecs({ profileComplete: Number(profileComplete), postFreq: Number(postFreq), engagement: Number(engagement), responsiveness: Number(responsiveness), platforms }, "en");
-    const recsSw = generateRecs({ profileComplete: Number(profileComplete), postFreq: Number(postFreq), engagement: Number(engagement), responsiveness: Number(responsiveness), platforms }, "sw");
+    // Generate AI recs (falls back through Groq → Gemini → Claude → rule-based)
+    const [recsEn, recsSw] = await Promise.all([
+      getAIRecommendations({ score: scoreValue, profileComplete: Number(profileComplete), postFreq: Number(postFreq), engagement: Number(engagement), responsiveness: Number(responsiveness), platforms, businessName, sector, location, language: "en" }),
+      getAIRecommendations({ score: scoreValue, profileComplete: Number(profileComplete), postFreq: Number(postFreq), engagement: Number(engagement), responsiveness: Number(responsiveness), platforms, businessName, sector, location, language: "sw" }),
+    ]);
 
     // Persist score + recommendations in a transaction
     const saved = await prisma.$transaction(async (tx) => {
